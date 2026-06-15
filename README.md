@@ -38,7 +38,7 @@ cp example.env .env
 
 ## Docker
 
-Требует наличия `docker` и `docker-compose`, а так же файла `.env` (см. предю пункт).
+Требует наличия `docker` и `docker-compose`, а так же файла `.env` (см. пред. пункт).
 
 Запуск:
 
