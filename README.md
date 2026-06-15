@@ -14,10 +14,10 @@ go build .
 
 Для начала установите расширение `Get cookies.txt LOCALLY` для [Chrome](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) или [Firefox](https://addons.mozilla.org/en-US/firefox/addon/get-cookies-txt-locally/), а затем экспортируйте cookies с `hh.ru` в `cookies.txt` (приложение по умолчанию его ищет в текущем каталоге).
 
-Запуск приложения:
+Для запуска приложения укажите ссылку для поиска по вакансиям:
 
 ```sh
-./hh-ai-applier -u "<сюда скопируйте ссылку для поиска вакансий из браузера со всеми нужными фильтрами>""
+./hh-ai-applier -u "https://hh.ru/search/vacancy?text=go&..."
 ```
 
 Используйте флаг `-h` для справки.
