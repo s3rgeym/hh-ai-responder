@@ -722,7 +722,6 @@ func (a *HHAutoApplier) SendResponse(payload url.Values, refererURL string) (map
 	}
 	defer resp.Body.Close()
 	status := resp.StatusCode
-	logger.Debug("%d %s %s", status, resp.Request.Method, resp.Request.URL.String())
 
 	if (status < 200 || status >= 300) && (status < 400 || status >= 500) {
 		return nil, unexpectedHTTPStatus(status)
