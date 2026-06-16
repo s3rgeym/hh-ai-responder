@@ -14,7 +14,7 @@ go build .
 
 Для начала установите расширение `Get cookies.txt LOCALLY` для [Chrome](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) или [Firefox](https://addons.mozilla.org/en-US/firefox/addon/get-cookies-txt-locally/), а затем экспортируйте cookies с `hh.ru` в `cookies.txt` (приложение по умолчанию его ищет в текущем каталоге).
 
-Для запуска приложения укажите ссылку для поиска по вакансиям со всеми нужными фильтрами:
+Для запуска приложения укажите ссылку для поиска по вакансиям:
 
 <img width="834" height="600" alt="Unsaved Image 1" src="https://github.com/user-attachments/assets/9a23879b-44a6-446f-b6d3-f496d57bc234" />
 
