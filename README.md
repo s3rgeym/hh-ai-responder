@@ -34,7 +34,16 @@ cp example.env .env
 
 > Приложение автоматически грузит переменные окружения из `.env` в текущем рабочем каталоге. У аргументов, переданных через командную строку, более высокий приоритет.
 
-И заполните `SEARCH_URL`, `AI_BASE_URL`, `AI_MODEL` и при необходимости `AI_API_KEY`, изучив пример `example.env`.
+И заполните `HH_SEARCH_URL`, `HH_AI_BASE_URL`, `HH_AI_MODEL` и при необходимости `HH_AI_API_KEY`, изучив пример `example.env`.
+
+Поддерживаемые переменные приложения:
+
+| Переменная | Назначение |
+| --- | --- |
+| `HH_SEARCH_URL` | URL поисковой выдачи HH с нужными фильтрами. |
+| `HH_AI_BASE_URL` | Базовый URL OpenAI-compatible API. |
+| `HH_AI_MODEL` | Модель AI. |
+| `HH_AI_API_KEY` | API key для OpenAI-compatible API. |
 
 ## Docker
 
