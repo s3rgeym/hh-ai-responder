@@ -26,9 +26,6 @@ jobs:
             goarch: amd64
             ext: ".exe"
           - goos: darwin
-            goarch: amd64
-            ext: ""
-          - goos: darwin
             goarch: arm64
             ext: ""
           - goos: android

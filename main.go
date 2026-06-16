@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,9 +48,10 @@ const (
 )
 
 var (
-	appCtx       = context.Background()
-	currentLevel = LevelInfo
-	logger       = NewLogger(os.Stderr)
+	appCtx                  = context.Background()
+	currentLevel            = LevelInfo
+	logger                  = NewLogger(os.Stderr)
+	latesteResumeHashRegexp = regexp.MustCompile(`"latestResumeHash":"([a-f0-9]+)"`)
 )
 
 type Config struct {
@@ -293,9 +295,13 @@ func NewHHAutoApplier(cfg Config) (*HHAutoApplier, error) {
 		return nil, err
 	}
 
+	logger.Debug("You are logged as: %s", applier.GetFullName())
+
 	if applier.resumeID == "" {
 		applier.resumeID = applier.latestResumeHash
 	}
+
+	logger.Debug("Your curremt resume id: %s", applier.resumeID)
 
 	return applier, nil
 }
@@ -419,7 +425,7 @@ func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string,
 
 	var lastErr error
 	for attempt := 1; attempt <= c.attempts; attempt++ {
-		result, err := c.chatOnce(body)
+		result, err := c.getChatResponse(body)
 		if err == nil {
 			return result, nil
 		}
@@ -442,7 +448,7 @@ func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string,
 	return "", lastErr
 }
 
-func (c *AIClient) chatOnce(body []byte) (string, error) {
+func (c *AIClient) getChatResponse(body []byte) (string, error) {
 	req, err := http.NewRequestWithContext(appCtx, http.MethodPost, c.baseURL+chatCompletionsPath, bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -622,6 +628,12 @@ func (a *HHAutoApplier) FetchProfileData() error {
 		return err
 	}
 
+	matches := latesteResumeHashRegexp.FindSubmatch(data)
+	if len(matches) < 2 {
+		return errors.New("latestResumeHash not found")
+	}
+	a.latestResumeHash = string(matches[1])
+
 	target := []byte(`"applicantResumes":`)
 	idx := bytes.Index(data, target)
 	if idx == -1 {
@@ -651,8 +663,6 @@ func (a *HHAutoApplier) FetchProfileData() error {
 			a.resumes[hash] = title
 		}
 	}
-
-	a.resumeID = resumesList[0].Attributes.Hash
 
 	targetAccount := []byte(`"account":`)
 	idxAccount := bytes.Index(data, targetAccount)
