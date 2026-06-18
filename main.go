@@ -1,4 +1,3 @@
-// Этот код сгенерирован ChatGPT 5.5 из исходников на Python и частично переписан мной.
 package main
 
 import (
@@ -20,22 +19,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 const (
-	userAgent            = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-	acceptHeader         = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-	acceptLanguageHeader = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-	requestInterval      = 1200 * time.Millisecond
-	defaultAIBaseURL     = "http://localhost:11434"
-	defaultAIModel       = "llama3.1:8b"
-	defaultAITimeout     = 45 * time.Second
-	defaultAIAttempts    = 1
-	aiRetryDelay         = 2 * time.Second
-	chatCompletionsPath  = "/v1/chat/completions"
+	acceptHeader           = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+	acceptLanguageHeader   = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+	aiRetryDelay           = 3 * time.Second
+	chatCompletionsPath    = "/v1/chat/completions"
+	defaultAIAttempts      = 2
+	defaultAIBaseURL       = "http://localhost:11434"
+	defaultAIModel         = "llama3.1:8b"
+	defaultAITimeout       = 60 * time.Second
+	defaultRequestInterval = 1200 * time.Millisecond
+	defaultWorkers         = 3
+	secCHUAHeader          = `"Chromium";v="149", "Google Chrome";v="149", "Not-A.Brand";v="99"`
+	userAgent              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
 
 type LogLevel int
@@ -48,25 +48,27 @@ const (
 )
 
 var (
-	appCtx                  = context.Background()
-	currentLevel            = LevelInfo
-	logger                  = NewLogger(os.Stderr)
+	logger                  *Logger
 	latesteResumeHashRegexp = regexp.MustCompile(`"latestResumeHash":"([a-f0-9]+)"`)
+	ErrNegotiationsLimit    = errors.New("Negotiations Limit Exceeded")
 )
 
 type Config struct {
-	SearchURL    string
-	CookiesPath  string
-	LogLevel     string
-	ResumeID     string
-	MaxResponses int
-	DryRun       bool
-	AIBaseURL    string
-	AIModel      string
-	AIAPIKey     string
-	AITimeout    time.Duration
-	AIAttempts   int
-	Contacts     string
+	SearchURL       string
+	CookiesPath     string
+	LogLevel        string
+	ResumeID        string
+	MaxResponses    int
+	DryRun          bool
+	AIBaseURL       string
+	AIModel         string
+	AIAPIKey        string
+	AITimeout       time.Duration
+	AIAttempts      int
+	ExtraPrompt     string
+	RequestInterval time.Duration
+	Workers         int
+	OutputPath      string
 }
 
 type Vacancy struct {
@@ -124,7 +126,7 @@ type Task struct {
 }
 
 type Solution struct {
-	ID    string `json:"id"` // В HH это строка!
+	ID    string `json:"id"`
 	Text  string `json:"text"`
 	Title string `json:"title"`
 	Value string `json:"value"`
@@ -146,12 +148,21 @@ type TestFormAnswer struct {
 	HasChoice  bool
 }
 
-type VacancyEvent struct {
-	Vacancy Vacancy
-	Err     error
+type ApplyResult struct {
+	URL       string    `json:"url"`
+	Name      string    `json:"name"`
+	Letter    string    `json:"letter"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+type HHResponse struct {
+	Status int
+	Text   string
+	JSON   map[string]any
 }
 
 type HHAutoApplier struct {
+	ctx              context.Context
 	baseURL          *url.URL
 	searchParams     url.Values
 	cookiesPath      string
@@ -167,11 +178,19 @@ type HHAutoApplier struct {
 	email            string
 	dryRun           bool
 	ai               *AIClient
-	contacts         string
-	lastRequest      atomic.Int64
+	extraPrompt      string
+	workers          int
+	outputPath       string
+
+	hhMu        sync.Mutex
+	lastReqAt   time.Time
+	reqInterval time.Duration
+
+	limitReached chan struct{}
 }
 
 type AIClient struct {
+	ctx      context.Context
 	baseURL  string
 	model    string
 	apiKey   string
@@ -185,10 +204,11 @@ type AIMessage struct {
 }
 
 type ChatCompletionRequest struct {
-	Model     string      `json:"model"`
-	Messages  []AIMessage `json:"messages"`
-	Stream    bool        `json:"stream"`
-	MaxTokens int         `json:"max_tokens,omitempty"`
+	Model       string      `json:"model"`
+	Messages    []AIMessage `json:"messages"`
+	Stream      bool        `json:"stream"`
+	MaxTokens   int         `json:"max_tokens,omitempty"`
+	Temperature float64     `json:"temperature,omitempty"`
 }
 
 type ChatCompletionResponse struct {
@@ -220,12 +240,14 @@ type ResumeItem struct {
 }
 
 type Logger struct {
-	base *log.Logger
+	base  *log.Logger
+	level LogLevel
 }
 
-func NewLogger(output io.Writer) *Logger {
+func NewLogger(output io.Writer, level LogLevel) *Logger {
 	return &Logger{
-		base: log.New(output, "", log.LstdFlags),
+		base:  log.New(output, "", log.LstdFlags),
+		level: level,
 	}
 }
 
@@ -235,30 +257,30 @@ func (l *Logger) write(level, color, format string, args ...any) {
 }
 
 func (l *Logger) Debug(format string, args ...any) {
-	if currentLevel <= LevelDebug {
+	if l.level <= LevelDebug {
 		l.write("DEBUG", "\x1b[34;20m", format, args...)
 	}
 }
 
 func (l *Logger) Info(format string, args ...any) {
-	if currentLevel <= LevelInfo {
+	if l.level <= LevelInfo {
 		l.write("INFO", "\x1b[32;20m", format, args...)
 	}
 }
 
 func (l *Logger) Warn(format string, args ...any) {
-	if currentLevel <= LevelWarn {
+	if l.level <= LevelWarn {
 		l.write("WARNING", "\x1b[33;20m", format, args...)
 	}
 }
 
 func (l *Logger) Error(format string, args ...any) {
-	if currentLevel <= LevelError {
+	if l.level <= LevelError {
 		l.write("ERROR", "\x1b[31;20m", format, args...)
 	}
 }
 
-func NewHHAutoApplier(cfg Config) (*HHAutoApplier, error) {
+func NewHHAutoApplier(ctx context.Context, cfg Config) (*HHAutoApplier, error) {
 	parsed, err := url.Parse(cfg.SearchURL)
 	if err != nil {
 		return nil, err
@@ -279,29 +301,41 @@ func NewHHAutoApplier(cfg Config) (*HHAutoApplier, error) {
 	}
 
 	applier := &HHAutoApplier{
+		ctx:          ctx,
 		baseURL:      baseURL,
-		searchParams: parsed.Query(),
 		cookiesPath:  cfg.CookiesPath,
 		maxResponses: cfg.MaxResponses,
 		client:       client,
 		jar:          jar,
 		resumeID:     cfg.ResumeID,
 		dryRun:       cfg.DryRun,
-		ai:           NewAIClient(cfg.AIBaseURL, cfg.AIModel, cfg.AIAPIKey, cfg.AITimeout, cfg.AIAttempts),
-		contacts:     cfg.Contacts,
+		ai:           NewAIClient(ctx, cfg.AIBaseURL, cfg.AIModel, cfg.AIAPIKey, cfg.AITimeout, cfg.AIAttempts),
+		extraPrompt:  cfg.ExtraPrompt,
+		workers:      cfg.Workers,
+		outputPath:   cfg.OutputPath,
+		reqInterval:  cfg.RequestInterval,
+		limitReached: make(chan struct{}, 1),
 	}
 
-	if err := applier.FetchProfileData(); err != nil {
+	q := parsed.Query()
+	q.Del("page")
+	applier.searchParams = q
+
+	if err := applier.loadProfileData(); err != nil {
 		return nil, err
 	}
 
-	logger.Debug("You are logged as: %s", applier.GetFullName())
+	logger.Debug("Logged in as: %s", applier.GetFullName())
 
 	if applier.resumeID == "" {
 		applier.resumeID = applier.latestResumeHash
 	}
 
-	logger.Debug("Your curremt resume id: %s", applier.resumeID)
+	if _, ok := applier.resumes[applier.resumeID]; !ok {
+		return nil, fmt.Errorf("resume with id %s not found", applier.resumeID)
+	}
+
+	logger.Debug("Current resume ID: %s", applier.resumeID)
 
 	return applier, nil
 }
@@ -318,12 +352,28 @@ func (a *HHAutoApplier) ResolveURL(endpoint string) string {
 	return a.baseURL.ResolveReference(ref).String()
 }
 
-func (a *HHAutoApplier) Request(method, endpoint string, body io.Reader, headers map[string]string) (*http.Response, error) {
-	if err := a.waitRequestSlot(); err != nil {
-		return nil, err
+func (a *HHAutoApplier) Request(method, endpoint string, body io.Reader, headers map[string]string) (*HHResponse, error) {
+	// Если лимит уже достигнут — новые запросы не отправляем
+	select {
+	case <-a.limitReached:
+		return nil, ErrNegotiationsLimit
+	default:
+	}
+	a.hhMu.Lock()
+	defer a.hhMu.Unlock()
+
+	now := time.Now()
+	if diff := a.lastReqAt.Add(a.reqInterval).Sub(now); diff > 0 {
+		timer := time.NewTimer(diff)
+		select {
+		case <-timer.C:
+		case <-a.ctx.Done():
+			timer.Stop()
+			return nil, a.ctx.Err()
+		}
 	}
 
-	req, err := http.NewRequestWithContext(appCtx, method, a.ResolveURL(endpoint), body)
+	req, err := http.NewRequestWithContext(a.ctx, method, a.ResolveURL(endpoint), body)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +381,12 @@ func (a *HHAutoApplier) Request(method, endpoint string, body io.Reader, headers
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept-Language", acceptLanguageHeader)
 	req.Header.Set("Accept", acceptHeader)
+	req.Header.Set("Sec-CH-UA", secCHUAHeader)
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
 	for key, value := range headers {
 		if value != "" {
 			req.Header.Set(key, value)
@@ -338,41 +394,38 @@ func (a *HHAutoApplier) Request(method, endpoint string, body io.Reader, headers
 	}
 
 	resp, err := a.client.Do(req)
+	a.lastReqAt = time.Now()
+
 	if err != nil {
 		return nil, err
 	}
-	logger.Debug("%d %s %s", resp.StatusCode, resp.Request.Method, resp.Request.URL.String())
-	return resp, nil
-}
+	defer resp.Body.Close()
 
-func (a *HHAutoApplier) waitRequestSlot() error {
-	for {
-		last := a.lastRequest.Load()
-		now := time.Now()
-
-		if last > 0 {
-			next := time.Unix(0, last).Add(requestInterval)
-			wait := time.Until(next)
-			if wait > 0 {
-				timer := time.NewTimer(wait)
-				select {
-				case <-timer.C:
-				case <-appCtx.Done():
-					timer.Stop()
-					return appCtx.Err()
-				}
-				now = time.Now()
-			}
-		}
-
-		if a.lastRequest.CompareAndSwap(last, now.UnixNano()) {
-			return nil
-		}
-
-		if err := appCtx.Err(); err != nil {
-			return err
-		}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
+
+	logger.Debug("%d %s %s", resp.StatusCode, resp.Request.Method, resp.Request.URL.String())
+	text := string(respBody)
+
+	var parsed map[string]any
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		parsed = nil
+	} else if errValue, ok := parsed["error"].(string); ok {
+		if errValue == "negotiations-limit-exceeded" {
+			logger.Warn("Application limit reached")
+			// сигнализируем всем остальным горутинам
+			select {
+			case a.limitReached <- struct{}{}:
+			default:
+			}
+			return nil, ErrNegotiationsLimit
+		}
+		return nil, fmt.Errorf("HH Error: %s", errValue)
+	}
+
+	return &HHResponse{Status: resp.StatusCode, Text: text, JSON: parsed}, nil
 }
 
 func (a *HHAutoApplier) GetCurrentResumeTitle() string {
@@ -395,11 +448,12 @@ func (a *HHAutoApplier) XSRFToken() string {
 	return ""
 }
 
-func NewAIClient(baseURL, model, apiKey string, timeout time.Duration, attempts int) *AIClient {
+func NewAIClient(ctx context.Context, baseURL, model, apiKey string, timeout time.Duration, attempts int) *AIClient {
 	if !strings.Contains(baseURL, "://") {
 		baseURL = "http://" + baseURL
 	}
 	return &AIClient{
+		ctx:      ctx,
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		model:    model,
 		apiKey:   apiKey,
@@ -410,12 +464,13 @@ func NewAIClient(baseURL, model, apiKey string, timeout time.Duration, attempts 
 	}
 }
 
-func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string, error) {
+func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int, temperature float64) (string, error) {
 	payload := ChatCompletionRequest{
-		Model:     c.model,
-		Messages:  []AIMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: userPrompt}},
-		Stream:    false,
-		MaxTokens: maxTokens,
+		Model:       c.model,
+		Messages:    []AIMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: userPrompt}},
+		Stream:      false,
+		MaxTokens:   maxTokens,
+		Temperature: temperature,
 	}
 
 	body, err := json.Marshal(payload)
@@ -431,7 +486,7 @@ func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string,
 		}
 		lastErr = err
 
-		if attempt == c.attempts || appCtx.Err() != nil {
+		if attempt == c.attempts || c.ctx.Err() != nil {
 			break
 		}
 
@@ -439,9 +494,9 @@ func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string,
 		timer := time.NewTimer(aiRetryDelay)
 		select {
 		case <-timer.C:
-		case <-appCtx.Done():
+		case <-c.ctx.Done():
 			timer.Stop()
-			return "", appCtx.Err()
+			return "", c.ctx.Err()
 		}
 	}
 
@@ -449,7 +504,7 @@ func (c *AIClient) Chat(systemPrompt, userPrompt string, maxTokens int) (string,
 }
 
 func (c *AIClient) getChatResponse(body []byte) (string, error) {
-	req, err := http.NewRequestWithContext(appCtx, http.MethodPost, c.baseURL+chatCompletionsPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.baseURL+chatCompletionsPath, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -470,8 +525,11 @@ func (c *AIClient) getChatResponse(body []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := c.ctx.Err(); err != nil {
+		return "", err
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", unexpectedHTTPStatus(resp.StatusCode)
+		return "", fmt.Errorf("ai request failed: %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	var result ChatCompletionResponse
@@ -485,27 +543,32 @@ func (c *AIClient) getChatResponse(body []byte) (string, error) {
 	return strings.TrimSpace(result.Choices[0].Message.Content), nil
 }
 
-func (c *AIClient) GenerateLetter(v Vacancy, resumeTitle, fullName, contacts string) (string, error) {
-	systemPrompt := "Сгенерируй сопроводительное письмо от моего имени без использования markdown и списков, и не длинее 2048 символов. В котором опиши почему указанная вакансия подходит для моего резюме. Так же добавь в конец письма мои контакты, если они были указаны."
-
-	contactsStr := contacts
-	if strings.TrimSpace(contactsStr) == "" {
-		contactsStr = "-"
+func (c *AIClient) GenerateLetter(v Vacancy, resumeTitle, fullName, extraPrompt string) (string, error) {
+	if err := c.ctx.Err(); err != nil {
+		return "", err
 	}
+	systemPrompt := "Сгенерируй сопроводительное письмо от моего имени без использования markdown и списков, и не длинее 2048 символов. В котором опиши почему указанная вакансия подходит для моего резюме."
 
 	userPrompt := fmt.Sprintf(
-		"Название вакансии для отклика: %s\nКомпания, опубликовавшая вакансию: %s\nНазвание моего резюме: %s\nМое полное имя: %s\nМои контакты: %s\n",
+		"Название вакансии для отклика: %s\nКомпания, опубликовавшая вакансию: %s\nНазвание моего резюме: %s\nМое полное имя: %s\n",
 		v.Name,
 		v.Company.Name,
 		resumeTitle,
 		fullName,
-		contactsStr,
 	)
 
-	return c.Chat(systemPrompt, userPrompt, 1024)
+	if strings.TrimSpace(extraPrompt) != "" {
+		userPrompt += "\nДополнительно учти следующее:\n" + extraPrompt + "\n"
+	}
+
+	// Ограничиваем ответ примерно 2048 символами (~512 токенов)
+	return c.Chat(systemPrompt, userPrompt, 512, 0.7)
 }
 
 func (c *AIClient) AnswerTest(tasks []Task) (map[int]TestFormAnswer, error) {
+	if err := c.ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(tasks) == 0 {
 		return nil, nil
 	}
@@ -542,6 +605,7 @@ func (c *AIClient) AnswerTest(tasks []Task) (map[int]TestFormAnswer, error) {
 Ответ должен начинаться с '{' и заканчиваться '}'.`,
 		prompt,
 		512+len(tasks)*64,
+		0.2,
 	)
 	if err != nil {
 		return nil, err
@@ -552,98 +616,57 @@ func (c *AIClient) AnswerTest(tasks []Task) (map[int]TestFormAnswer, error) {
 		logger.Error("AI returned invalid test JSON: %.2000s", strings.TrimSpace(answer))
 		return nil, err
 	}
-
-	results := make(map[int]TestFormAnswer, len(tasks))
-	seen := make(map[int]bool, len(tasks))
-	tasksByID := make(map[int]Task, len(tasks))
-	allowedSolutions := make(map[int]map[int]bool, len(tasks))
-
-	for _, task := range tasks {
-		tasksByID[task.ID] = task
-		if len(task.CandidateSolutions) > 0 {
-			allowed := make(map[int]bool, len(task.CandidateSolutions))
-			for _, sol := range task.CandidateSolutions {
-				solID, err := strconv.Atoi(sol.ID)
-				if err != nil {
-					return nil, fmt.Errorf("invalid solution ID format %q: %w", sol.ID, err)
-				}
-				allowed[solID] = true
-			}
-			allowedSolutions[task.ID] = allowed
-		}
-	}
+	results := make(map[int]TestFormAnswer, len(parsed.Answers))
 
 	for _, item := range parsed.Answers {
-		taskID := item.TaskID
-		task, ok := tasksByID[taskID]
-		if !ok {
-			return nil, fmt.Errorf("ai returned answer for unknown task %d", taskID)
-		}
-		if seen[taskID] {
-			return nil, fmt.Errorf("ai returned duplicate answer for task %d", taskID)
-		}
-		seen[taskID] = true
-
-		if len(task.CandidateSolutions) > 0 {
-			if item.SolutionID == nil {
-				return nil, fmt.Errorf("ai returned no solution_id for task %d", taskID)
+		if item.SolutionID != nil {
+			results[item.TaskID] = TestFormAnswer{
+				SolutionID: *item.SolutionID,
+				HasChoice:  true,
 			}
-			solID := *item.SolutionID
-			if !allowedSolutions[taskID][solID] {
-				return nil, fmt.Errorf("ai returned invalid solution_id %d for task %d", solID, taskID)
+		} else {
+			results[item.TaskID] = TestFormAnswer{
+				TextAnswer: strings.TrimSpace(item.TextAnswer),
 			}
-			results[taskID] = TestFormAnswer{SolutionID: solID, HasChoice: true}
-			continue
 		}
-
-		textAnswer := strings.TrimSpace(item.TextAnswer)
-		if textAnswer == "" {
-			return nil, fmt.Errorf("ai returned empty text_answer for task %d", taskID)
-		}
-		results[taskID] = TestFormAnswer{TextAnswer: textAnswer}
 	}
 
-	for _, task := range tasks {
-		if !seen[task.ID] {
-			return nil, fmt.Errorf("ai returned no answer for task %d", task.ID)
-		}
+	if len(results) != len(tasks) {
+		return nil, fmt.Errorf("ai returned incomplete answers: got %d, expected %d", len(results), len(tasks))
 	}
 
 	return results, nil
 }
 
-func (a *HHAutoApplier) FetchProfileData() error {
+func (a *HHAutoApplier) loadProfileData() error {
+	if err := a.ctx.Err(); err != nil {
+		return err
+	}
 	resp, err := a.Request(http.MethodGet, "/applicant/resumes", nil, nil)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return unexpectedHTTPStatus(resp.StatusCode)
+	if resp.Status != http.StatusOK {
+		return unexpectedHTTPStatus(resp.Status)
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	matches := latesteResumeHashRegexp.FindSubmatch(data)
+	matches := latesteResumeHashRegexp.FindStringSubmatch(resp.Text)
 	if len(matches) < 2 {
 		return errors.New("latestResumeHash not found")
 	}
 	a.latestResumeHash = string(matches[1])
 
-	target := []byte(`"applicantResumes":`)
-	idx := bytes.Index(data, target)
+	target := `"applicantResumes":`
+	idx := strings.Index(resp.Text, target)
 	if idx == -1 {
 		return errors.New("applicantResumes block not found on page")
 	}
 
-	jsonStart := data[idx+len(target):]
+	jsonStart := resp.Text[idx+len(target):]
 
 	var resumesList []ResumeItem
-	decoder := json.NewDecoder(bytes.NewReader(jsonStart))
+	decoder := json.NewDecoder(strings.NewReader(jsonStart))
 	if err := decoder.Decode(&resumesList); err != nil {
 		return fmt.Errorf("failed to partially parse resumes: %w", err)
 	}
@@ -664,16 +687,16 @@ func (a *HHAutoApplier) FetchProfileData() error {
 		}
 	}
 
-	targetAccount := []byte(`"account":`)
-	idxAccount := bytes.Index(data, targetAccount)
+	targetAccount := `"account":`
+	idxAccount := strings.Index(resp.Text, targetAccount)
 	if idxAccount == -1 {
 		return errors.New("account block not found on page")
 	}
 
-	jsonStartAccount := data[idxAccount+len(targetAccount):]
+	jsonStartAccount := resp.Text[idxAccount+len(targetAccount):]
 
 	var acc AccountInfo
-	decoderAccount := json.NewDecoder(bytes.NewReader(jsonStartAccount))
+	decoderAccount := json.NewDecoder(strings.NewReader(jsonStartAccount))
 	if err := decoderAccount.Decode(&acc); err != nil {
 		return fmt.Errorf("failed to partially parse account: %w", err)
 	}
@@ -687,23 +710,20 @@ func (a *HHAutoApplier) FetchProfileData() error {
 }
 
 func (a *HHAutoApplier) GetVacancyTests(responseURL string) (map[string]VacancyTest, error) {
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 	resp, err := a.Request(http.MethodGet, responseURL, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, unexpectedHTTPStatus(resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if resp.Status != http.StatusOK {
+		return nil, unexpectedHTTPStatus(resp.Status)
 	}
 
 	var tests map[string]VacancyTest
-	if err := decodeEmbeddedJSON(data, `,"vacancyTests":`, &tests); err != nil {
+	if err := decodeEmbeddedJSON(resp.Text, `,"vacancyTests":`, &tests); err != nil {
 		return nil, err
 	}
 
@@ -711,6 +731,9 @@ func (a *HHAutoApplier) GetVacancyTests(responseURL string) (map[string]VacancyT
 }
 
 func (a *HHAutoApplier) SendResponse(payload url.Values, refererURL string) (map[string]any, error) {
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 	token := a.XSRFToken()
 	if token == "" {
 		return nil, errors.New("xsrf token not found")
@@ -730,35 +753,26 @@ func (a *HHAutoApplier) SendResponse(payload url.Values, refererURL string) (map
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	status := resp.StatusCode
+	// status := resp.Status
 
-	if (status < 200 || status >= 300) && (status < 400 || status >= 500) {
-		return nil, unexpectedHTTPStatus(status)
-	}
+	// Разрешаем только 2xx и 4xx (4xx обрабатываются через JSON-ответ)
+	// if !(status >= 200 && status < 300) && !(status >= 400 && status < 500) {
+	// 	return nil, unexpectedHTTPStatus(status)
+	// }
 
-	var result map[string]any
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if err := a.ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("failed to decode JSON response: %w", err)
-		}
-
-		// timestamp := time.Now().Format("20060102_150405")
-		// fileName := fmt.Sprintf("%s.json", timestamp)
-		//
-		// filePath := filepath.Join(os.TempDir(), fileName)
-		//
-		// os.WriteFile(filePath, body, 0644)
-		// logger.Debug("Ответ сохранен в %s", filePath)
+	if resp.JSON == nil {
+		return nil, fmt.Errorf("non JSON response")
 	}
-	return result, nil
+	return resp.JSON, nil
 }
 
 func (a *HHAutoApplier) ApplyVacancy(vacancyID int, refererURL, letter string) (map[string]any, error) {
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 	token := a.XSRFToken()
 	if token == "" {
 		return nil, errors.New("xsrf token not found")
@@ -776,6 +790,9 @@ func (a *HHAutoApplier) ApplyVacancy(vacancyID int, refererURL, letter string) (
 }
 
 func (a *HHAutoApplier) ApplyVacancyWithTest(vacancyID int, letter string) (map[string]any, error) {
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 	token := a.XSRFToken()
 	if token == "" {
 		return nil, errors.New("xsrf token not found")
@@ -787,7 +804,7 @@ func (a *HHAutoApplier) ApplyVacancyWithTest(vacancyID int, letter string) (map[
 		return nil, err
 	}
 
-	logger.Debug("Tests: %v", tests)
+	logger.Debug("Vacancy tests: %v", tests)
 
 	test, ok := tests[strconv.Itoa(vacancyID)]
 	if !ok {
@@ -812,12 +829,14 @@ func (a *HHAutoApplier) ApplyVacancyWithTest(vacancyID int, letter string) (map[
 	payload.Set("country_ids", "[]")
 
 	answers, err := a.ai.AnswerTest(test.Tasks)
-
 	if err != nil {
 		return nil, fmt.Errorf("ai failed to answer test: %w", err)
 	}
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	logger.Debug("Answers: %v", answers)
+	logger.Debug("AI answers: %v", answers)
 
 	for _, task := range test.Tasks {
 		taskID := task.ID
@@ -838,36 +857,10 @@ func (a *HHAutoApplier) ApplyVacancyWithTest(vacancyID int, letter string) (map[
 	return a.SendResponse(payload, responseURL)
 }
 
-func (a *HHAutoApplier) Vacancies() <-chan VacancyEvent {
-	out := make(chan VacancyEvent)
-
-	go func() {
-		defer close(out)
-
-		for page := 0; ; page++ {
-			vacancies, err := a.fetchVacancyPage(page)
-			if err != nil {
-				sendVacancy(out, VacancyEvent{Err: err})
-				return
-			}
-
-			logger.Debug("Найдено вакансий %d на странице %d", len(vacancies), page+1)
-			if len(vacancies) == 0 {
-				return
-			}
-
-			for _, vacancy := range vacancies {
-				if !sendVacancy(out, VacancyEvent{Vacancy: vacancy}) {
-					return
-				}
-			}
-		}
-	}()
-
-	return out
-}
-
 func (a *HHAutoApplier) fetchVacancyPage(page int) ([]Vacancy, error) {
+	if err := a.ctx.Err(); err != nil {
+		return nil, err
+	}
 	params := cloneValues(a.searchParams)
 	params.Set("page", strconv.Itoa(page))
 
@@ -875,116 +868,135 @@ func (a *HHAutoApplier) fetchVacancyPage(page int) ([]Vacancy, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, unexpectedHTTPStatus(resp.StatusCode)
+	if resp.Status != http.StatusOK {
+		return nil, unexpectedHTTPStatus(resp.Status)
 	}
 
 	var vacancies []Vacancy
-	if err := decodeEmbeddedJSON(body, `,"vacancies":`, &vacancies); err != nil {
+	if err := decodeEmbeddedJSON(resp.Text, `,"vacancies":`, &vacancies); err != nil {
 		return nil, err
 	}
 
 	return vacancies, nil
 }
 
-func sendVacancy(results chan<- VacancyEvent, result VacancyEvent) bool {
-	select {
-	case results <- result:
-		return true
-	case <-appCtx.Done():
-		return false
-	}
-}
-
 func (a *HHAutoApplier) ApplyVacancies() error {
-	for item := range a.Vacancies() {
-		if item.Err != nil {
-			return item.Err
-		}
-		if err := appCtx.Err(); err != nil {
-			break
-		}
+	ctx, cancel := context.WithCancel(a.ctx)
+	defer cancel()
 
-		vacancy := item.Vacancy
-		vacancyURL := vacancy.Links["desktop"]
+	vacanciesCh := make(chan Vacancy, a.workers*2)
 
-		if len(vacancy.UserLabels) > 0 {
-			logger.Debug("Пропускаем вакансию с откликом: %s", vacancyURL)
-			continue
-		}
-
-		if a.maxResponses > 0 && vacancy.TotalResponsesCount >= a.maxResponses {
-			logger.Debug(
-				"Пропускаем вакансию, так как количество откликов превысило порог игнорирования: %s; %d >= %d",
-				vacancyURL,
-				vacancy.TotalResponsesCount,
-				a.maxResponses,
-			)
-			continue
-		}
-
-		letter, err := a.ai.GenerateLetter(vacancy, a.GetCurrentResumeTitle(), a.GetFullName(), a.contacts)
-		if err != nil {
-			logger.Error("AI не смогла сгенерировать письмо: %s; %v", vacancyURL, err)
-			continue
-		}
-
-		logger.Debug("Сопроводительное письмо:\n\n%s", letter)
-
-		logger.Debug(
-			"Пробуем откликнуться на вакансию %q (%s; откликов: %d)",
-			vacancy.Name,
-			vacancyURL,
-			vacancy.TotalResponsesCount,
-		)
-
-		if a.dryRun {
-			continue
-		}
-
-		var responseResult map[string]any
-		if vacancy.UserTestPresent {
-			responseResult, err = a.ApplyVacancyWithTest(vacancy.ID, letter)
-		} else {
-			responseResult, err = a.ApplyVacancy(vacancy.ID, vacancyURL, letter)
-		}
-		if err != nil {
-			logger.Error("Ошибка при обработке ID %d: %v", vacancy.ID, err)
-			continue
-		}
-
-		if errValue, ok := responseResult["error"].(string); ok && errValue != "" {
-			if errValue == "negotiations-limit-exceeded" {
-				logger.Warn("Суточный лимит откликов исчерпан")
-				return nil
+	go func() {
+		defer close(vacanciesCh)
+		for page := 0; ; page++ {
+			if ctx.Err() != nil {
+				return
 			}
 
-			logger.Error("%s: %s", errValue, vacancyURL)
-			continue
-		}
+			vacancies, err := a.fetchVacancyPage(page)
+			if err != nil {
+				// if errors.Is(err, ErrNegotiationsLimit) {
+				//     return
+				// }
+				logger.Error("Failed to fetch vacancies: %v", err)
+				cancel()
+				return
+			}
 
-		// logger.Info("Отклик отправлен: %s - %s", vacancyURL, vacancy.Name)
-		if success, _ := responseResult["success"].(string); success == "true" {
-			logger.Info("Отклик отправлен: %s - %s", vacancyURL, vacancy.Name)
-			fmt.Println(vacancyURL)
-			continue
-		}
+			if len(vacancies) == 0 {
+				return
+			}
 
-		logger.Error("Неизвестная ошибка при отклике на вакансию: %s (%s)", vacancyURL, vacancy.Name)
+			for _, vacancy := range vacancies {
+				if len(vacancy.UserLabels) > 0 {
+					continue
+				}
+				if a.maxResponses > 0 && vacancy.TotalResponsesCount >= a.maxResponses {
+					continue
+				}
+
+				select {
+				case vacanciesCh <- vacancy:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	var out io.Writer = os.Stdout
+	if a.outputPath != "" {
+		f, err := os.OpenFile(a.outputPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			cancel()
+			return err
+		}
+		defer f.Close()
+		out = f
+	}
+	encoder := json.NewEncoder(out)
+	var mu sync.Mutex
+
+	var wg sync.WaitGroup
+	for i := 0; i < a.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for vacancy := range vacanciesCh {
+				if ctx.Err() != nil {
+					return
+				}
+
+				vacancyURL, ok := vacancy.Links["desktop"]
+				if !ok || vacancyURL == "" {
+					logger.Warn("Vacancy %d has no desktop link", vacancy.ID)
+					continue
+				}
+
+				letter, err := a.ai.GenerateLetter(vacancy, a.GetCurrentResumeTitle(), a.GetFullName(), a.extraPrompt)
+				if err != nil {
+					logger.Error("AI failed to generate letter for %s: %v", vacancyURL, err)
+					continue
+				}
+
+				if a.dryRun {
+					logger.Debug("Application skipped (dry-run): %s", vacancyURL)
+					continue
+				}
+
+				var responseResult map[string]any
+				if vacancy.UserTestPresent {
+					responseResult, err = a.ApplyVacancyWithTest(vacancy.ID, letter)
+				} else {
+					responseResult, err = a.ApplyVacancy(vacancy.ID, vacancyURL, letter)
+				}
+
+				if err != nil {
+					if errors.Is(err, ErrNegotiationsLimit) {
+						return
+					}
+					logger.Error("Failed to send application %d: %v", vacancy.ID, err)
+					continue
+				}
+
+				if success, _ := responseResult["success"].(string); success == "true" {
+					logger.Info("Application successfully sent: %s", vacancyURL)
+					mu.Lock()
+					_ = encoder.Encode(ApplyResult{
+						URL:       vacancyURL,
+						Name:      vacancy.Name,
+						Letter:    letter,
+						AppliedAt: time.Now(),
+					})
+					mu.Unlock()
+				}
+			}
+		}()
 	}
 
-	if appCtx.Err() != nil {
-		logger.Warn("Interrupted by user")
-		return nil
-	}
-
-	logger.Info("Завершили работу!")
+	wg.Wait()
+	logger.Info("Finished processing!")
 	return nil
 }
 
@@ -1092,7 +1104,8 @@ func (j *MemoryPersistentJar) Cookies(u *url.URL) []*http.Cookie {
 				if cookie.Secure && u.Scheme != "https" {
 					continue
 				}
-				matched = append(matched, cookie)
+				copied := *cookie
+				matched = append(matched, &copied)
 				active = append(active, cookie)
 			}
 			j.cookies[domain] = active
@@ -1136,14 +1149,14 @@ func (j *MemoryPersistentJar) Save(path string) error {
 	return os.WriteFile(path, buffer.Bytes(), 0o600)
 }
 
-func decodeEmbeddedJSON[T any](data []byte, marker string, out *T) error {
-	_, after, ok := bytes.Cut(data, []byte(marker))
+func decodeEmbeddedJSON[T any](data string, marker string, out *T) error {
+	_, after, ok := strings.Cut(data, marker)
 	if !ok {
 		return fmt.Errorf("marker %q not found in response", marker)
 	}
 
 	var raw json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(after))
+	decoder := json.NewDecoder(strings.NewReader(after))
 	if err := decoder.Decode(&raw); err != nil {
 		return err
 	}
@@ -1159,18 +1172,21 @@ func parseConfig() (Config, error) {
 
 	cfg := Config{}
 
-	flag.StringVar(&cfg.SearchURL, "u", "", "URL поискового запроса")
-	flag.StringVar(&cfg.CookiesPath, "c", filepath.Join(wd, "cookies.txt"), "Путь к cookies")
-	flag.StringVar(&cfg.LogLevel, "l", "info", "Уровень логирования (debug, info, warn, error)")
-	flag.StringVar(&cfg.ResumeID, "r", "", "ID резюме или будет использовано последнее")
-	flag.IntVar(&cfg.MaxResponses, "mr", 0, "Пропускать вакансии, где количество откликов больше или равно N")
-	flag.BoolVar(&cfg.DryRun, "d", false, "Не рассылать реальные отклики")
-	flag.StringVar(&cfg.AIBaseURL, "ai-base-url", defaultAIBaseURL, "Базовый URL OpenAI-compatible API")
-	flag.StringVar(&cfg.AIModel, "ai-model", defaultAIModel, "Модель AI")
-	flag.StringVar(&cfg.AIAPIKey, "ai-api-key", "", "API key для OpenAI-compatible API")
-	flag.DurationVar(&cfg.AITimeout, "ai-timeout", defaultAITimeout, "Таймаут для запросов к AI")
-	flag.IntVar(&cfg.AIAttempts, "ai-attempts", defaultAIAttempts, "Количество попыток запроса к AI")
-	flag.StringVar(&cfg.Contacts, "C", "", "Ваши контактные данные для связи")
+	flag.StringVar(&cfg.SearchURL, "u", "", "Search URL")
+	flag.StringVar(&cfg.CookiesPath, "c", filepath.Join(wd, "cookies.txt"), "Path to cookies file")
+	flag.StringVar(&cfg.LogLevel, "l", "info", "Log level (debug, info, warn, error)")
+	flag.StringVar(&cfg.ResumeID, "r", "", "Resume ID (latest will be used if empty)")
+	flag.IntVar(&cfg.MaxResponses, "mr", 0, "Skip vacancies with responses count >= N")
+	flag.BoolVar(&cfg.DryRun, "d", false, "Do not send real applications")
+	flag.StringVar(&cfg.AIBaseURL, "ai-base-url", defaultAIBaseURL, "Base URL for OpenAI-compatible API")
+	flag.StringVar(&cfg.AIModel, "ai-model", defaultAIModel, "AI model name")
+	flag.StringVar(&cfg.AIAPIKey, "ai-api-key", "", "API key for OpenAI-compatible API")
+	flag.DurationVar(&cfg.AITimeout, "ai-timeout", defaultAITimeout, "Timeout for AI requests")
+	flag.IntVar(&cfg.AIAttempts, "ai-attempts", defaultAIAttempts, "Number of AI request attempts")
+	flag.StringVar(&cfg.ExtraPrompt, "p", "", "Additional user prompt for letter generation")
+	flag.DurationVar(&cfg.RequestInterval, "request-interval", defaultRequestInterval, "Minimum interval between requests to hh.ru (e.g. 1200ms, 2s)")
+	flag.IntVar(&cfg.Workers, "w", defaultWorkers, "Number of parallel workers")
+	flag.StringVar(&cfg.OutputPath, "o", "", "Path to output file (jsonl). If empty — stdout")
 	flag.Parse()
 
 	_ = loadDotEnv(".env")
@@ -1194,10 +1210,16 @@ func parseConfig() (Config, error) {
 	}
 
 	if cfg.SearchURL == "" {
-		return Config{}, errors.New("не указан URL поиска: задайте флаг -u или переменную HH_SEARCH_URL")
+		return Config{}, errors.New("search URL is not specified: use -u flag or HH_SEARCH_URL env variable")
 	}
 	if cfg.AIAttempts < 1 {
-		return Config{}, errors.New("количество попыток AI должно быть больше 0")
+		return Config{}, errors.New("ai-attempts must be greater than 0")
+	}
+	if cfg.RequestInterval <= 0 {
+		return Config{}, errors.New("request-interval must be greater than 0")
+	}
+	if cfg.Workers < 1 {
+		return Config{}, errors.New("workers must be greater than 0")
 	}
 
 	return cfg, nil
@@ -1236,23 +1258,22 @@ func loadDotEnv(path string) error {
 	return scanner.Err()
 }
 
-func setupLogging(cfg Config) {
-	switch strings.ToLower(cfg.LogLevel) {
+func parseLogLevel(level string) LogLevel {
+	switch strings.ToLower(level) {
 	case "debug":
-		currentLevel = LevelDebug
+		return LevelDebug
 	case "warn", "warning":
-		currentLevel = LevelWarn
+		return LevelWarn
 	case "error":
-		currentLevel = LevelError
+		return LevelError
 	default:
-		currentLevel = LevelInfo
+		return LevelInfo
 	}
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	appCtx = ctx
 
 	cfg, err := parseConfig()
 	if err != nil {
@@ -1260,21 +1281,21 @@ func main() {
 		os.Exit(2)
 	}
 
-	setupLogging(cfg)
+	logger = NewLogger(os.Stderr, parseLogLevel(cfg.LogLevel))
 
-	applier, err := NewHHAutoApplier(cfg)
+	applier, err := NewHHAutoApplier(ctx, cfg)
 	if err != nil {
 		logger.Error("%v", err)
 		os.Exit(1)
 	}
 	defer func() {
 		if err := applier.Close(); err != nil {
-			logger.Error("Ошибка закрытия приложения: %v", err)
+			logger.Error("Failed to close application: %v", err)
 		}
 	}()
 
 	if err := applier.ApplyVacancies(); err != nil {
-		logger.Error("%v", err)
+		logger.Error("Execution error: %v", err)
 		os.Exit(1)
 	}
 }
