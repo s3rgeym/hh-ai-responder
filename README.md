@@ -19,7 +19,7 @@ go build .
 <img width="834" height="600" src="https://github.com/user-attachments/assets/9a23879b-44a6-446f-b6d3-f496d57bc234" />
 
 ```sh
-./hh-ai-applier -u "https://hh.ru/search/vacancy?..."
+./hh-ai-applier -c ./cookies.txt -u "https://hh.ru/search/vacancy?..."
 ```
 
 Из данной ссылки берется тот же базовый адрес сайта, чтобы не было лишних редиректов, а равно запросов. Выбор различных фильтров в интерфейсе, приводит к изменению параметров **Query String** ссылки, а поэтому они будут применяться и при работе через программу, если ее скопировать и передать.
