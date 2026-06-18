@@ -131,4 +131,4 @@ docker compose up -d --build
 https://github.com/s3rgeym/hh-ai-applier
 ```
 
-Полный текст лицензии см. в файле [`LICENSE`](LICENSE).
+Полный текст лицензии см. в файле [LICENSE](LICENSE).
