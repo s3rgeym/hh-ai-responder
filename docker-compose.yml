@@ -1,29 +1,8 @@
 services:
-  # Основной контейнер с приложением
-  hh-ai-applier:
+  hh-ai-responder:
     build: .
-    container_name: hh-ai-applier
-    # Оставляем контейнер запущенным, чтобы Ofelia могла заходить в него по расписанию
-    command: tail -f /dev/null
+    container_name: hh-ai-responder
+    restart: on-failure
     env_file: .env
     volumes:
       - .:/app
-    labels:
-      ofelia.enabled: "true"
-      ofelia.job-exec.hh-apply.run-on-startup: "true"
-      ofelia.job-exec.hh-apply.schedule: ${OFELIA_SCHEDULE:-@every 4h}
-      ofelia.job-exec.hh-apply.command: "hh-ai-applier"
-
-  # Планировщик Ofelia
-  scheduler:
-    image: mcuadros/ofelia:latest
-    container_name: hh-scheduler
-    depends_on:
-      - hh-ai-applier
-    command: daemon --docker
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      #- ./logs:/logs
-    restart: unless-stopped
-    # labels:
-    #   ofelia.save-folder: "/logs"

@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$App = "hh-ai-applier.exe"
+$App = "hh-ai-responder.exe"
 
 try {
     # Переходим в директорию, где находится скрипт
@@ -40,6 +40,6 @@ if (-not ($App.ToLower().EndsWith(".exe"))) {
     exit 3
 }
 
-# Запускаем приложение, передавая аргументы
-& ".\\$App" @args
+# Запускаем приложение без передачи аргументов
+& ".\\$App"
 exit $LASTEXITCODE
