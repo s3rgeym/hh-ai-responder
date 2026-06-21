@@ -6,4 +6,4 @@ services:
     env_file: .env
     volumes:
       - .:/app
-    command: ["-o", "results.json"]
+    command: ["-o", "results.json", "-l", "debug"]
