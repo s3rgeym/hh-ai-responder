@@ -2,7 +2,8 @@ services:
   hh-ai-responder:
     build: .
     container_name: hh-ai-responder
-    restart: on-failure
+    restart: unless-stopped
     env_file: .env
     volumes:
       - .:/app
+    command: ["-o", "results.json"]

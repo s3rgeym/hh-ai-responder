@@ -77,7 +77,8 @@ cp example.env .env
 | `HH_AI_MODEL`            | `-ai-model`      | Модель AI.                                                                |
 | `HH_AI_API_KEY`          | `-ai-api-key`    | API key для OpenAI-compatible API.                                        |
 | `HH_EXTRA_LETTER_PROMPT` | `-letter-prompt` | Дополнительные инструкции для сопроводительного письма.                   |
-| `HH_EXTRA_TEST_PROMPT`   | `-test-prompt`   | Дополнительные инструкции для решения тестов.                             |
+| `HH_EXTRA_ANSWER_PROMPT` | `-answer-prompt` | Дополнительные инструкции для решения тестов.                             |
+| `HH_EXTRA_CHAT_PROMPT`   | `-chat-prompt`   | Дополнительные инструкции для ответов в чатах с работодателями.           |
 | `HH_CONTACTS`            | `-contacts`      | Контакты (телефон, email и т.д.), которые будут добавлены в конец письма. |
 
 Например, для Chat-GPT нужно указать сл:
