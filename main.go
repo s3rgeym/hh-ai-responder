@@ -579,15 +579,15 @@ func (responder *HHAIResponder) LeaveChat(chatId int64) (map[string]any, error) 
 }
 
 type ChatToReply struct {
-	ID             int64
-	ContactName    string
-	ReplyToMessage string
-	VacancyName    string
-	VacancyURL     string
-	CompanyName    string
-	Compensation   string
-	ReplyOptions   []string
-	IsDiscard      bool
+	ID                  int64
+	ContactName         string
+	ReplyToMessage      string
+	VacancyName         string
+	VacancyURL          string
+	CompanyName         string
+	VacancyCompensation string
+	ReplyOptions        []string
+	IsDiscard           bool
 }
 
 func (responder *HHAIResponder) getChatsAwaitingReply(maxPages int) ([]ChatToReply, error) {
@@ -656,14 +656,14 @@ func (responder *HHAIResponder) getChatsAwaitingReply(maxPages int) ([]ChatToRep
 			}
 
 			chatInfo := ChatToReply{
-				ID:             chat.ID,
-				ContactName:    last.ParticipantDisplay.Name,
-				ReplyToMessage: last.Text,
-				ReplyOptions:   options,
-				VacancyName:    vacancy.Name,
-				VacancyURL:     vacancy.Links.Desktop,
-				CompanyName:    vacancy.Company.Name,
-				Compensation:   FormatCompensation(vacancy.Compensation),
+				ID:                  chat.ID,
+				ContactName:         last.ParticipantDisplay.Name,
+				ReplyToMessage:      last.Text,
+				ReplyOptions:        options,
+				VacancyName:         vacancy.Name,
+				VacancyURL:          vacancy.Links.Desktop,
+				CompanyName:         vacancy.Company.Name,
+				VacancyCompensation: FormatCompensation(vacancy.Compensation),
 			}
 
 			if last.WorkflowTransition != nil && last.WorkflowTransition.ApplicantState == "DISCARD" {
@@ -728,13 +728,20 @@ func (responder *HHAIResponder) AutoRespondChats() error {
 			)
 		} else {
 			userPrompt += fmt.Sprintf(`
+Название вакансии: %s
+Зарплата: %s
+Компания: %s
+Контактное лицо: %s
+
 Правила:
 
 - Если просят выполнить тестовое задание или заполнить гуглодок, форму, анкету или иной документ по ссылке, то вежливо отвечай, что у тебя нет времени на выполнение.
 - Вместо этого попроси связаться с тобой по указанным контактам и посмотреть код на Github.
 - Если контакты далее не указаны, попроси использовать контакты из резюме.
+- Если контактным лицом является робот или ИИ, отвечай ему максимально сдержанно без лишних любезностей.
+- Если спросят про зарплату, называй сумму чуть ниже максимальной, но не ниже средней по рынку, делай сноску, что конечная сумма зависит только от нагруженности и ты можешь согласиться на меньшую сумму, если работа не в тягость.
 - Если спросят являешься ли ты ботом, то отвечай, что ты программа, разработанная пользователям Github s3rgeym, который устал от общения с ботами на дегенеративных сетях и глупыми hr-менеджерами, верящими в таро и нейро-оракулов, а поэтому автоматизировал общение с ними.
-- Твоя дефолтная ссылка на Github, если в дальнейшем не указана другая: %s`, defaultGithubURL)
+- Твоя дефолтная ссылка на Github, если в дальнейшем не указана другая: %s`, chat.VacancyName, chat.VacancyCompensation, chat.CompanyName, chat.ContactName, defaultGithubURL)
 		}
 
 		if strings.TrimSpace(responder.contacts) != "" {
