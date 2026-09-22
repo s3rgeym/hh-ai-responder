@@ -65,11 +65,23 @@ cp example.env .env
 | `HH_SEARCH_URL`        | `-u`                 | URL для поиска вакансий.                                               |
 | `HH_AI_BASE_URL`       | `-ai-base-url`       | Базовый URL OpenAI-compatible API.                                     |
 | `HH_AI_MODEL`          | `-ai-model`          | Модель AI.                                                             |
+| `HH_AI_TIMEOUT`        | `-ai-timeout`        | Таймаут запроса к ИИ целиком (Go-duration, по умолчанию `120s`). Reasoning-модели на длинном промпте письма отвечают 20–40 с, поэтому 30 с их резало. |
+| `HH_AI_CONNECT_TIMEOUT`| `-ai-connect-timeout`| Таймаут установки соединения с ИИ (по умолчанию `5s`).                 |
+| `HH_AI_ATTEMPTS`       | `-ai-attempts`       | Сколько раз повторять запрос к ИИ (по умолчанию `2`).                  |
+| `HH_AI_REASONING_EFFORT`| `-ai-reasoning-effort`| Усилие рассуждения: `minimal`, `low`, `medium` (по умолчанию), `high`, `max`. `max` давал 1400–3100 reasoning-токенов и 22–41 с, `medium` — 450–520 токенов и 9–10 с при письме того же размера. |
 | `HH_AI_API_KEY`        | `-ai-api-key`        | API key для OpenAI-compatible API.                                     |
+| `HH_LETTER_AI_BASE_URL`| `-letter-ai-base-url`| Отдельный API для сопроводительных писем (по умолчанию — как `HH_AI_BASE_URL`). |
+| `HH_LETTER_AI_MODEL`   | `-letter-ai-model`   | Отдельная модель для писем, например более сильная (по умолчанию — как `HH_AI_MODEL`). |
+| `HH_LETTER_AI_API_KEY` | `-letter-ai-api-key` | API key для модели писем (по умолчанию — как `HH_AI_API_KEY`).         |
 | `HH_LETTER_PROMPT`     | `-letter-prompt`     | Дополнительные инструкции для сопроводительного письма.                |
 | `HH_SOLUTION_PROMPT`   | `-solution-prompt`   | Дополнительные инструкции для решения тестов.                          |
 | `HH_CHAT_REPLY_PROMPT` | `-chat-reply-prompt` | Дополнительные инструкции для ответов в чатах с работодателями.        |
 | `HH_CONTACTS`          | `-contacts`          | Контакты (телефон, email и т.д.), которые будут добавлены в сообщение. |
+| `HH_REQUEST_INTERVAL`  | `-request-interval`  | Базовый интервал между запросами к hh.ru (Go-duration: `10s`, `1m`).   |
+| `HH_HUMAN_PACING`      | `-human-pacing`      | Рандомизировать паузы и делать длинные перерывы (по умолчанию `true`). |
+| `HH_BROWSER_PROFILE`   | `-browser-profile`   | Имитируемый отпечаток TLS/HTTP2: `chrome_152` (по умолчанию) или `off`.|
+| `HH_BROWSER_PLATFORM`  | `-browser-platform`  | Платформа в заголовках браузера: `macos` (по умолчанию) или `windows`. Имитация должна совпадать с той системой, откуда получены cookies. |
+| —                      | `-seen`              | Файл с ID вакансий, по которым уже была попытка отклика (по умолчанию `seen_vacancies.json`), чтобы не генерировать письмо повторно. |
 
 Например, для Chat-GPT нужно указать сл:
 
@@ -80,6 +92,25 @@ HH_AI_BASE_URL="https://api.openai.com"
 HH_AI_MODEL="gpt-4o-mini"
 HH_AI_API_KEY="ваш_api_ключ_от_openai"
 ```
+
+## Защита от определения бота
+
+hh.ru стоит за ddos-guard и оценивает клиентов по TLS/HTTP2-отпечатку, набору
+заголовков и ритму запросов. Приложение:
+
+- ходит на hh.ru через клиент, воспроизводящий отпечаток Chrome (`HH_BROWSER_PROFILE`);
+- шлёт `Origin`/`Priority` и браузерный `Accept` на POST-запросах, как настоящий XHR;
+- делает паузы между запросами случайными и периодически останавливается на 45–150 с.
+
+Если hh.ru всё-таки ответит `hhcaptcha.isBot`, приложение запускается в терминале
+и может спросить: оно подаёт звуковой сигнал, открывает картинку капчи в системном
+просмотрщике и ждёт ввода текста. Ответ уходит в тот же отклик (`captchaKey`,
+`captchaText`, `captchaState`, как делает сайт), при ошибке придёт новая картинка.
+Пустой ввод или три ошибки подряд останавливают рассылку.
+
+Без терминала (Docker без `-it`, nohup) спрашивать некого: отклик не отправляется,
+приложение останавливает рассылку, «забывает» вакансию (попробует позже) и просит
+пройти капчу в обычном браузере.
 
 ## Docker
 

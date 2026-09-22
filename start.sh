@@ -18,6 +18,17 @@ if [ -f ".env" ]; then
   set +a
 fi
 
+# Пересобираем, если есть Go (чтобы подхватить изменения промпта)
+if command -v go >/dev/null 2>&1; then
+  go build -o "$APP" . || exit 4
+fi
+
+# Если ссылки нет ни в аргументах, ни в .env (HH_SEARCH_URL), спрашиваем
+if [ $# -eq 0 ] && [ -z "${HH_SEARCH_URL:-}" ]; then
+  read -r -p "Ссылка на поиск вакансий: " url
+  [ -n "$url" ] && set -- -u "$url"
+fi
+
 # Проверяем наличие бинарника
 if [ ! -f "$APP" ]; then
   echo "ERROR: $APP not found" >&2
@@ -30,5 +41,4 @@ if [ ! -x "$APP" ]; then
   exit 3
 fi
 
-# Запускаем приложение без передачи аргументов
-exec "./$APP"
+exec "./$APP" "$@"
